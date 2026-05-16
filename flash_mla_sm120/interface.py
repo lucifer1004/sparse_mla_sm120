@@ -145,6 +145,81 @@ def flash_mla_sparse_fwd(
                      if extra_indices_in_kvcache.dim() == 3
                      else extra_indices_in_kvcache)
 
+    # DIAGNOSTIC: dump kernel inputs to /tmp before the (possibly faulting)
+    # call so a standalone repro can be reconstructed. Controlled by env
+    # var SPARSE_MLA_DUMP=1.
+    import os as _os
+    if _os.environ.get("SPARSE_MLA_PRESYNC") == "1":
+        # Force-sync BEFORE the kernel. If the IMA fires here, the offending
+        # kernel ran earlier in the stream.
+        try:
+            torch.cuda.synchronize()
+            print("[SPARSE_MLA_PRESYNC] pre-call cuda sync OK", flush=True)
+        except Exception as e:
+            print(f"[SPARSE_MLA_PRESYNC] pre-call cuda sync FAILED: {e}", flush=True)
+            raise
+        _os.environ["SPARSE_MLA_PRESYNC"] = "0"
+    if _os.environ.get("SPARSE_MLA_DUMP_STRIDES") == "1":
+        _idx_s = indices.squeeze(1) if indices.dim() == 3 else indices
+        def _info(t, name):
+            if t is None:
+                return f"{name}=None"
+            return f"{name}=shape{tuple(t.shape)}/stride{tuple(t.stride())}/{t.dtype}/contig={t.is_contiguous()}"
+        print(f"[SPARSE_MLA_STRIDES] "
+              f"{_info(q, 'q')} | "
+              f"{_info(kv, 'kv')} | "
+              f"{_info(_idx_s, 'idx')} | "
+              f"{_info(attn_sink, 'sink')} | "
+              f"{_info(topk_length, 'tl')} | "
+              f"{_info(extra_k_cache, 'extra_kv')} | "
+              f"{_info(extra_idx, 'extra_idx')} | "
+              f"{_info(out, 'out')}",
+              flush=True)
+        _os.environ["SPARSE_MLA_DUMP_STRIDES"] = "0"
+    if _os.environ.get("SPARSE_MLA_DUMP") == "1":
+        _idx = indices.squeeze(1) if indices.dim() == 3 else indices
+
+        def _snap(t):
+            """Snapshot a tensor preserving shape AND strides exactly."""
+            if t is None:
+                return None
+            return {
+                "data": t.detach().cpu().contiguous().view(-1).clone(),
+                "shape": tuple(t.shape),
+                "stride": tuple(t.stride()),
+                "dtype": t.dtype,
+                "storage_offset": int(t.storage_offset()),
+                "is_contiguous": bool(t.is_contiguous()),
+            }
+        _dump = {
+            "q": _snap(q),
+            "kv": _snap(kv),
+            "indices": _snap(_idx),
+            "sm_scale": float(sm_scale),
+            "d_v": int(d_v),
+            "attn_sink": _snap(attn_sink),
+            "topk_length": _snap(topk_length),
+            "extra_k_cache": _snap(extra_k_cache),
+            "extra_idx": _snap(extra_idx),
+            "extra_topk_length": _snap(extra_topk_length),
+            "out_shape": tuple(out.shape) if out is not None else None,
+            "out_stride": tuple(out.stride()) if out is not None else None,
+            "out_dtype": str(out.dtype) if out is not None else None,
+        }
+        _path = f"/tmp/sparse_mla_dump_{_os.getpid()}.pt"
+        torch.save(_dump, _path)
+        # Also a tiny summary the dump tool can scan without loading tensors.
+        print(f"[SPARSE_MLA_DUMP] q={tuple(q.shape)} {q.dtype} "
+              f"kv={tuple(kv.shape)} {kv.dtype} "
+              f"idx={tuple(_idx.shape)} idx_max={int(_idx.max().item())} idx_min={int(_idx.min().item())} "
+              f"topk_length={None if topk_length is None else (int(topk_length.min().item()), int(topk_length.max().item()))} "
+              f"extra_k_cache={'present' if extra_k_cache is not None else None} "
+              f"extra_idx={'present' if extra_idx is not None else None} "
+              f"saved={_path}",
+              flush=True)
+        # Only dump the FIRST call (the one likely to IMA); avoid spam.
+        _os.environ["SPARSE_MLA_DUMP"] = "0"
+
     # Caller may pass `out` with shape (num_tokens, h_q, d_v) — the kernel's
     # native output layout — so forward it directly with no view gymnastics.
     result = sparse_mla_fwd(

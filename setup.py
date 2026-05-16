@@ -20,24 +20,27 @@ header_depends = (
     + glob.glob(os.path.join("csrc", "**", "*.h"), recursive=True)
 )
 
+_nvcc_args = [
+    "-O3",
+    "-std=c++17",
+    "-gencode=arch=compute_120a,code=sm_120a",
+    "-gencode=arch=compute_120f,code=sm_120f",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--ptxas-options=-v",
+    "-DNDEBUG",
+    "-lineinfo",
+    "--threads",
+    "8",
+]
+if os.environ.get("SPARSE_MLA_DEBUG_IO") == "1":
+    _nvcc_args.append("-DSPARSE_MLA_DEBUG_IO")
 extra_compile_args = {
     "cxx": ["-O3", "-std=c++17"],
-    "nvcc": [
-        "-O3",
-        "-std=c++17",
-        "-gencode=arch=compute_120a,code=sm_120a",
-        "-gencode=arch=compute_120f,code=sm_120f",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "--ptxas-options=-v",
-        "-DNDEBUG",
-        "-lineinfo",
-        "--threads",
-        "8",
-    ],
+    "nvcc": _nvcc_args,
 }
 
 setup(
