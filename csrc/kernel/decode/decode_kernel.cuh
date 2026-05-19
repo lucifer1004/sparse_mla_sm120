@@ -144,14 +144,21 @@ sparse_mla_decode_kernel(
                                  + (ti - TILES_PER_SPLIT_MAIN) * BI;
         };
 
-        // Prologue: gather tile 0 (always main-cache)
-        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
-            sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid,
-            stride_kv_block, kv_l2_policy);
+        // Prologue: gather tile 0 (always main-cache).
+        // Scales-then-bulk ordering: io_gather_scales is synchronous (no mbar
+        // signal). The math warps wake up on mbar_kv (signaled by the
+        // bulk_gather's cp.async.bulk completion). If scales were gathered
+        // AFTER the bulk, the cp.async could complete with scales still in
+        // flight, and math would read stale scales. Ordering scales-then-bulk
+        // + threadfence_block ensures scales are visible before mbar signal.
+        // (Same race pattern fixed in prefill_kernel.cuh.)
         io_gather_scales<MT, PAGE_BLOCK_SIZE>(
             sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid,
             stride_kv_block);
         __threadfence_block();
+        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+            sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid,
+            stride_kv_block, kv_l2_policy);
 
         #pragma unroll
         for (int ti = 0; ti < TILES_PER_SPLIT; ti++) {
@@ -163,41 +170,44 @@ sparse_mla_decode_kernel(
                 // PAGE_BLOCK_SIZE template arg differs between main and extra
                 // caches for DSv4 compressed-cache layers (where extra
                 // block_size = main_block_size / compress_ratio).
+                // Scales-then-bulk ordering (see prologue comment): scales
+                // visible before mbar signal so math reads them safely.
                 if constexpr (TOPK_EXTRA == 0) {
+                    io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                        sm.kv_scale_bufs[(ti + 1) & 1],
+                        next_idx, next_kv, io_tid,
+                        next_stride);
+                    __threadfence_block();
                     io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
                         sm.kv_bufs[(ti + 1) & 1],
                         next_idx, next_kv,
                         sm.mbar_kv + ((ti + 1) & 1), io_tid,
                         next_stride, kv_l2_policy);
-                    io_gather_scales<MT, PAGE_BLOCK_SIZE>(
-                        sm.kv_scale_bufs[(ti + 1) & 1],
-                        next_idx, next_kv, io_tid,
-                        next_stride);
                 } else {
                     if (ti + 1 < NI) {
+                        io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                            sm.kv_scale_bufs[(ti + 1) & 1],
+                            next_idx, next_kv, io_tid,
+                            next_stride);
+                        __threadfence_block();
                         io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
                             sm.kv_bufs[(ti + 1) & 1],
                             next_idx, next_kv,
                             sm.mbar_kv + ((ti + 1) & 1), io_tid,
                             next_stride, kv_l2_policy);
-                        io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                    } else {
+                        io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
                             sm.kv_scale_bufs[(ti + 1) & 1],
                             next_idx, next_kv, io_tid,
                             next_stride);
-                    } else {
+                        __threadfence_block();
                         io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
                             sm.kv_bufs[(ti + 1) & 1],
                             next_idx, next_kv,
                             sm.mbar_kv + ((ti + 1) & 1), io_tid,
                             next_stride, kv_l2_policy);
-                        io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
-                            sm.kv_scale_bufs[(ti + 1) & 1],
-                            next_idx, next_kv, io_tid,
-                            next_stride);
                     }
                 }
-                // [F3] threadfence for scale visibility in main loop
-                __threadfence_block();
             }
             bar_sync_t<1, BLOCK_THREADS>();
         }

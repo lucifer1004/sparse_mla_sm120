@@ -482,11 +482,19 @@ sparse_mla_prefill_kernel(
 //   - Deferred row_sum (warp_l_partial in registers, reduce once at end)
 //   - Better compute/load ratio → higher MMA utilization
 //
-// Used for NUM_HEADS > HPB (h=64, 128). h=16 stays on SG.
+// Used for NUM_HEADS >= HPB. With MG_N_HG_T template:
+//   MG_N_HG_T=1 (HEADS_PER_CTA=16) → NUM_HEADS=16 dual-cache (replaces SG@16
+//                                    for swa+dual_cache layers where SG is
+//                                    single-cache only)
+//   MG_N_HG_T=2 (HEADS_PER_CTA=32) → NUM_HEADS in {32,64,128} (legacy path)
+// Single-cache NUM_HEADS=16 still uses the SG kernel above (no change).
 // ============================================================================
 
-static constexpr int MG_N_HG = 2;
-static constexpr int MG_HEADS_PER_CTA = MG_N_HG * HPB;  // 32
+// Default MG_N_HG used by the SmemLayoutMG / SmemPtrsMG types (which are
+// shared across MG_N_HG_T=1 and MG_N_HG_T=2 — see the comment in the kernel
+// body). The non-default instantiation just wastes a bit of unused smem.
+static constexpr int MG_N_HG_DEFAULT = 2;
+static constexpr int MG_HEADS_PER_CTA_DEFAULT = MG_N_HG_DEFAULT * HPB;  // 32
 
 // Dual-cache MG prefill (Design A: phase-within-block, online softmax persists
 // across phases). When TOPK_EXTRA == 0 the extra-phase branches dead-code-
@@ -495,7 +503,7 @@ static constexpr int MG_HEADS_PER_CTA = MG_N_HG * HPB;  // 32
 // KV_cache followed by NI_EXTRA = TOPK_EXTRA/BI tiles from KV_cache_extra,
 // sharing one set of online-softmax accumulators so the softmax denominator
 // is computed over the union of indices.
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0, int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0, int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE, int MG_N_HG_T = MG_N_HG_DEFAULT>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 sparse_mla_prefill_mg_kernel(
     const bf16* __restrict__ Q,
@@ -508,6 +516,16 @@ sparse_mla_prefill_mg_kernel(
     const float* __restrict__ attn_sink,           // [NUM_HEADS], nullable
     __grid_constant__ const PrefillColdParams cold)
 {
+    // Per-instantiation MG_N_HG / MG_HEADS_PER_CTA. With MG_N_HG_T=1 the
+    // kernel processes one head group per CTA (HEADS_PER_CTA=16). The
+    // SmemLayoutMG / SmemPtrsMG types are still parameterised on the default
+    // N_HG=2 layout, so the MG_N_HG_T=1 instantiation wastes ~half the MG
+    // smem (one unused q_nope/q_sc slot + half of m_smem/l_smem/reduce_buf/
+    // w_smem) but it keeps the per-group loop `for (g = 0; g < MG_N_HG; ++g)`
+    // unchanged (g=0 only) and avoids a full SmemLayoutMG retemplate.
+    constexpr int MG_N_HG = MG_N_HG_T;
+    constexpr int MG_HEADS_PER_CTA = MG_N_HG_T * HPB;
+
     const float sm_scale = cold.sm_scale;
     const int num_tokens = cold.num_tokens;
     constexpr int page_block_size = PAGE_BLOCK_SIZE;
@@ -523,6 +541,8 @@ sparse_mla_prefill_mg_kernel(
     static constexpr int NI = TOPK / BI;
     static constexpr int NI_EXTRA = TOPK_EXTRA / BI;
     static constexpr int NI_TOTAL = NI + NI_EXTRA;
+    static_assert(NUM_HEADS % MG_HEADS_PER_CTA == 0,
+        "NUM_HEADS must be a multiple of MG_HEADS_PER_CTA = MG_N_HG_T * HPB");
     static constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA;
     static constexpr int QK_NOPE_KSTEPS = KV::QUANT_TILE / 32;
 
@@ -573,12 +593,23 @@ sparse_mla_prefill_mg_kernel(
         };
 
         // Prologue: gather tile 0 (always main cache; idx_base + 0 == ptr).
-        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
-            sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid,
-            stride_kv_block, kv_l2_policy);
+        // Scales first: io_gather_scales is synchronous (plain stores), no
+        // mbar signal. The math warps wake up on mbar_kv (signaled by the
+        // bulk gather's cp.async.bulk completion). If scales were gathered
+        // AFTER the bulk gather, the bulk could complete while scales are
+        // still in flight, and math would read partial / stale scales.
+        // Ordering scales-then-bulk + threadfence_block ensures scales are
+        // visible before bulk-completion (and thus before math wake-up).
+        // The MG_N_HG_T=1 dispatch (NUM_HEADS=16) has half the math work per
+        // iter, which narrows the natural race window and exposes the bug —
+        // caught by compute-sanitizer racecheck (write @ kv_cache_io.cuh:99
+        // vs read @ prefill_kernel.cuh:775).
         io_gather_scales<MT, PAGE_BLOCK_SIZE>(
             sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid, stride_kv_block);
         __threadfence_block();
+        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+            sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid,
+            stride_kv_block, kv_l2_policy);
 
         // For dual-cache (TOPK_EXTRA > 0) we always iterate NI_TOTAL — topk_length
         // masking happens at the QK stage. For single-cache, short-circuit at
@@ -590,40 +621,44 @@ sparse_mla_prefill_mg_kernel(
                 const uint8_t* next_kv = tile_kv_ptr(ti + 1);
                 const size_t   next_stride = tile_stride(ti + 1);
                 const int32_t* next_idx = tile_idx_ptr(ti + 1);
+                // Scales-first ordering (see prologue comment): scales sync
+                // before bulk gather signals mbar so math sees them on wake.
                 if constexpr (TOPK_EXTRA == 0) {
+                    io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                        sm.kv_scale_bufs[(ti + 1) & 1],
+                        next_idx, next_kv, io_tid,
+                        next_stride);
+                    __threadfence_block();
                     io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
                         sm.kv_bufs[(ti + 1) & 1],
                         next_idx, next_kv,
                         sm.mbar_kv + ((ti + 1) & 1), io_tid,
                         next_stride, kv_l2_policy);
-                    io_gather_scales<MT, PAGE_BLOCK_SIZE>(
-                        sm.kv_scale_bufs[(ti + 1) & 1],
-                        next_idx, next_kv, io_tid,
-                        next_stride);
                 } else {
                     if (ti + 1 < NI) {
+                        io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                            sm.kv_scale_bufs[(ti + 1) & 1],
+                            next_idx, next_kv, io_tid,
+                            next_stride);
+                        __threadfence_block();
                         io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
                             sm.kv_bufs[(ti + 1) & 1],
                             next_idx, next_kv,
                             sm.mbar_kv + ((ti + 1) & 1), io_tid,
                             next_stride, kv_l2_policy);
-                        io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                    } else {
+                        io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
                             sm.kv_scale_bufs[(ti + 1) & 1],
                             next_idx, next_kv, io_tid,
                             next_stride);
-                    } else {
+                        __threadfence_block();
                         io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
                             sm.kv_bufs[(ti + 1) & 1],
                             next_idx, next_kv,
                             sm.mbar_kv + ((ti + 1) & 1), io_tid,
                             next_stride, kv_l2_policy);
-                        io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
-                            sm.kv_scale_bufs[(ti + 1) & 1],
-                            next_idx, next_kv, io_tid,
-                            next_stride);
                     }
                 }
-                __threadfence_block();
             }
             bar_sync_t<1, BLOCK_THREADS>();
         }
@@ -950,8 +985,15 @@ sparse_mla_prefill_mg_kernel(
                             acc_o[g][ti_acc][2] += xv[2] * sc1; acc_o[g][ti_acc][3] += xv[3] * sc1;
                         }
                     }
+                    // Barrier guards vc=k's ldmatrix reads against vc=k+1's
+                    // FP8-weight writes to the SAME w_fp8 region. With
+                    // MG_N_HG_T=1 the per-vc read window is half the work
+                    // (one group instead of two), narrowing the natural
+                    // timing gap and exposing the race that the bar at the
+                    // end of the loop alone doesn't cover. Caught by
+                    // compute-sanitizer racecheck against ldmatrix.x4.
+                    bar_sync_t<2, MATH_THREADS>();
                 }
-                bar_sync_t<2, MATH_THREADS>();
             }
 
             // ── XV rope BF16 MMA (MODEL1, both groups) ──────────────

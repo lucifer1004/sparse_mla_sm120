@@ -372,6 +372,10 @@ sparse_mla_combine_v2_kernel(__grid_constant__ const CombineV2Params params)
 }
 
 // ── MAX_SPLITS dispatch macro ───────────────────────────────────────
+// MAX_SPLITS=256 covers up to 256 SMs. RTX PRO 6000 Blackwell has 188 SMs;
+// with NUM_HEADS=16 (REPLICATE_H=1) num_sm_parts = num_sms / 1 = 188, which
+// previously hit "exceeds MAX_SPLITS=128". 256 = ~4 KB extra smem in combine
+// kernel (COMBINE_BLOCK_H=8, +128 floats * 4 bytes), fits in 99 KB budget.
 #define COMBINE_SPLITS_SWITCH(NSPLITS, NAME, ...)       \
     [&] {                                               \
         if ((NSPLITS) <= 32) {                          \
@@ -383,9 +387,12 @@ sparse_mla_combine_v2_kernel(__grid_constant__ const CombineV2Params params)
         } else if ((NSPLITS) <= 128) {                  \
             constexpr int NAME = 128;                   \
             return __VA_ARGS__();                        \
+        } else if ((NSPLITS) <= 256) {                  \
+            constexpr int NAME = 256;                   \
+            return __VA_ARGS__();                        \
         } else {                                        \
             TORCH_CHECK(false, "nsplits=", (NSPLITS),   \
-                        " exceeds MAX_SPLITS=128");     \
+                        " exceeds MAX_SPLITS=256");     \
         }                                               \
     }()
 

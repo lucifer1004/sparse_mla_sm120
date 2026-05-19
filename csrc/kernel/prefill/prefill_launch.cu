@@ -47,7 +47,10 @@ void launch_prefill_sg(
 // / indices_extra pointers may be nullptr and stride_kv_block_extra is unused;
 // the kernel template instantiation produces single-cache code via
 // if-constexpr dead-code-elim, matching the prior behavior.
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0, int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
+// MG_N_HG_T defaults to 2 (HEADS_PER_CTA=32, NUM_HEADS in {32,64,128}); pass
+// 1 (HEADS_PER_CTA=16) to dispatch NUM_HEADS=16 through MG (covers swa+dual
+// layers for which SG doesn't have dual-cache support).
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int TOPK_EXTRA = 0, int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE, int MG_N_HG_T = MG_N_HG_DEFAULT>
 void launch_prefill_mg(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
     const uint8_t* KV_cache_extra, const int32_t* indices_extra,
@@ -60,11 +63,14 @@ void launch_prefill_mg(
     cudaStream_t stream)
 {
     constexpr size_t smem_bytes = SmemLayoutMG<MT, CM>::TOTAL;
-    constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA;
+    constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
+    static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0,
+        "NUM_HEADS must be a multiple of MG_N_HG_T * HPB");
+    constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA_LOCAL;
     dim3 grid(num_tokens * REPLICATE_H);
     dim3 block(BLOCK_THREADS);
 
-    auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, TOPK_EXTRA, PAGE_BLOCK_SIZE_EXTRA>;
+    auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, TOPK_EXTRA, PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>;
     static bool configured = false;
     if (!configured && smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -234,8 +240,12 @@ void sparse_mla_prefill_launch_model1_dual(
         "MODEL1 dual prefill: extra page_block_size must be 64 or 2, got ",
         page_block_size_extra);
 
-    #define DISPATCH_DUAL_MG(NH, TK, TK_EX, PBSX) \
-        launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, TK_EX, PBSX>( \
+    // NH=16 is dispatched through launch_prefill_mg with MG_N_HG_T=1 (so
+    // HEADS_PER_CTA=16). 32/64/128 use the default MG_N_HG_T=2 (HEADS_PER_CTA
+    // =32). This lets vllm pad TP=4 (16 real heads) and TP=8 (8 real, padded
+    // to 16) to NUM_HEADS=16 without going through SG (SG has no dual-cache).
+    #define DISPATCH_DUAL_MG(NH, TK, TK_EX, PBSX, NHG) \
+        launch_prefill_mg<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, TK_EX, PBSX, NHG>( \
             Q_ptr, KV_ptr, idx_ptr, KV_extra_ptr, idx_extra_ptr, \
             attn_sink_ptr, O_ptr, LSE_ptr, sm_scale, num_tokens, \
             stride_kv_block, stride_kv_block_extra, \
@@ -243,27 +253,30 @@ void sparse_mla_prefill_launch_model1_dual(
 
     if (topk == 128 && topk_extra == 128 && page_block_size_extra == 64) {
         switch (num_heads) {
-        case 32:  DISPATCH_DUAL_MG(32, 128, 128, 64); break;
-        case 64:  DISPATCH_DUAL_MG(64, 128, 128, 64); break;
-        case 128: DISPATCH_DUAL_MG(128, 128, 128, 64); break;
+        case 16:  DISPATCH_DUAL_MG(16,  128, 128, 64, 1); break;
+        case 32:  DISPATCH_DUAL_MG(32,  128, 128, 64, 2); break;
+        case 64:  DISPATCH_DUAL_MG(64,  128, 128, 64, 2); break;
+        case 128: DISPATCH_DUAL_MG(128, 128, 128, 64, 2); break;
         default:
             TORCH_CHECK(false, "MODEL1 dual prefill: unsupported num_heads=", num_heads);
         }
     } else if (topk == 128 && topk_extra == 512 && page_block_size_extra == 64) {
         // DSv4-Flash C4A: SWA window=128, indexer top_k=512, compress_ratio=4.
         switch (num_heads) {
-        case 32:  DISPATCH_DUAL_MG(32, 128, 512, 64); break;
-        case 64:  DISPATCH_DUAL_MG(64, 128, 512, 64); break;
-        case 128: DISPATCH_DUAL_MG(128, 128, 512, 64); break;
+        case 16:  DISPATCH_DUAL_MG(16,  128, 512, 64, 1); break;
+        case 32:  DISPATCH_DUAL_MG(32,  128, 512, 64, 2); break;
+        case 64:  DISPATCH_DUAL_MG(64,  128, 512, 64, 2); break;
+        case 128: DISPATCH_DUAL_MG(128, 128, 512, 64, 2); break;
         default:
             TORCH_CHECK(false, "MODEL1 dual prefill: unsupported num_heads=", num_heads);
         }
     } else if (topk == 128 && topk_extra == 512 && page_block_size_extra == 2) {
         // DSv4-Flash C128A: SWA window=128, indexer top_k=512, compress_ratio=128.
         switch (num_heads) {
-        case 32:  DISPATCH_DUAL_MG(32, 128, 512, 2); break;
-        case 64:  DISPATCH_DUAL_MG(64, 128, 512, 2); break;
-        case 128: DISPATCH_DUAL_MG(128, 128, 512, 2); break;
+        case 16:  DISPATCH_DUAL_MG(16,  128, 512, 2, 1); break;
+        case 32:  DISPATCH_DUAL_MG(32,  128, 512, 2, 2); break;
+        case 64:  DISPATCH_DUAL_MG(64,  128, 512, 2, 2); break;
+        case 128: DISPATCH_DUAL_MG(128, 128, 512, 2, 2); break;
         default:
             TORCH_CHECK(false, "MODEL1 dual prefill: unsupported num_heads=", num_heads);
         }

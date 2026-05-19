@@ -150,23 +150,31 @@ sparse_mla_decode_v2_kernel(
         // When PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE (typical), both branches
         // compile to the same instantiation; otherwise the extra-cache branch
         // picks the smaller block-size kernel (e.g. DSv4 C128A: 2).
+        //
+        // Scales-then-bulk ordering: io_gather_scales is synchronous (no mbar
+        // signal). Math wakes on mbar_kv signaled by bulk completion; if scales
+        // were written AFTER the bulk, math could read partial scales.
+        // Threadfence between the two makes scales visible before the bulk
+        // signals mbar. (Same race pattern fixed in prefill_kernel.cuh.)
         auto io_gather_one = [&](int global_blk, int buf_idx) {
             if (global_blk < num_orig_blocks) {
                 const int32_t* idx_ptr = indices + (size_t)s_i * topk + (size_t)global_blk * BI;
+                io_gather_scales<MT, PAGE_BLOCK_SIZE>(
+                    sm.kv_scale_bufs[buf_idx], idx_ptr, KV_cache, io_tid, stride_kv_block);
+                __threadfence_block();
                 io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
                     sm.kv_bufs[buf_idx], idx_ptr, KV_cache,
                     sm.mbar_kv + buf_idx, io_tid, stride_kv_block, kv_l2_policy);
-                io_gather_scales<MT, PAGE_BLOCK_SIZE>(
-                    sm.kv_scale_bufs[buf_idx], idx_ptr, KV_cache, io_tid, stride_kv_block);
             } else {
                 int eb = global_blk - num_orig_blocks;
                 const int32_t* idx_ptr = extra_indices + (size_t)s_i * cold.extra_topk + (size_t)eb * BI;
-                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
-                    sm.kv_bufs[buf_idx], idx_ptr, extra_KV_cache,
-                    sm.mbar_kv + buf_idx, io_tid, cold.stride_extra_kv_block, kv_l2_policy);
                 io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
                     sm.kv_scale_bufs[buf_idx], idx_ptr, extra_KV_cache,
                     io_tid, cold.stride_extra_kv_block);
+                __threadfence_block();
+                io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
+                    sm.kv_bufs[buf_idx], idx_ptr, extra_KV_cache,
+                    sm.mbar_kv + buf_idx, io_tid, cold.stride_extra_kv_block, kv_l2_policy);
             }
         };
 
