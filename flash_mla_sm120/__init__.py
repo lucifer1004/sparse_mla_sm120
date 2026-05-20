@@ -5,8 +5,14 @@ from .interface import (
     flash_mla_with_kvcache,
     flash_mla_sparse_fwd,
 )
+# Canonical plan/run wrapper (FlashInfer-style). Prefer this over the
+# standalone functions for new code — see flash_mla_sm120/wrapper.py.
+from .wrapper import BatchSparseMLAPagedAttentionWrapper
 
 __all__ = [
+    # Canonical (preferred): plan/run wrapper
+    "BatchSparseMLAPagedAttentionWrapper",
+    # Legacy: standalone fns, kept for backward compatibility
     "sparse_mla_decode_fwd",
     "sparse_mla_prefill_fwd",
     "sparse_mla_fwd",
