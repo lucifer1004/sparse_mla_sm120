@@ -323,8 +323,12 @@ class BatchSparseMLAPagedAttentionWrapper:
         assert self._head_dim_v is not None
         assert self._sm_scale is not None
 
-        # Shape sanity (cheap; kernel does the rest).
-        num_tokens, num_heads, d_qk = q.shape
+        # Normalize q to 3-D: accept ``[num_tokens, num_heads, d_qk]`` (3-D)
+        # or ``[batch, s_q, num_heads, d_qk]`` (FlashMLA-style 4-D). vLLM's
+        # decode path passes 4-D with ``s_q=1``; the prefill path passes
+        # 3-D directly.
+        q_2dim = q if q.dim() == 3 else q.reshape(-1, q.size(-2), q.size(-1))
+        num_tokens, num_heads, d_qk = q_2dim.shape
         if num_heads != self._num_heads:
             raise ValueError(
                 f"q num_heads={num_heads} != plan's num_heads={self._num_heads}"
@@ -333,10 +337,18 @@ class BatchSparseMLAPagedAttentionWrapper:
             raise ValueError(
                 f"q head_dim={d_qk} != plan's head_dim_qk={self._head_dim_qk}"
             )
-        if sparse_indices.shape != (num_tokens, self._topk):
+
+        # Same flexibility for sparse_indices: accept ``[N, topk]`` (2-D)
+        # or ``[N, 1, topk]`` (3-D, FlashMLA-style with s_q=1 axis).
+        sparse_indices_2d = (
+            sparse_indices
+            if sparse_indices.dim() == 2
+            else sparse_indices.squeeze(1)
+        )
+        if sparse_indices_2d.shape != (num_tokens, self._topk):
             raise ValueError(
                 f"sparse_indices shape {tuple(sparse_indices.shape)} != "
-                f"({num_tokens}, {self._topk})"
+                f"({num_tokens}, {self._topk}) (or 3-D equivalent)"
             )
         if self._extra_topk > 0:
             if extra_kv_cache is None or extra_indices is None:
@@ -344,21 +356,37 @@ class BatchSparseMLAPagedAttentionWrapper:
                     "plan() set extra_topk > 0 but run() got "
                     "extra_kv_cache=None or extra_indices=None"
                 )
-            if extra_indices.shape != (num_tokens, self._extra_topk):
+            extra_indices_2d = (
+                extra_indices
+                if extra_indices.dim() == 2
+                else extra_indices.squeeze(1)
+            )
+            if extra_indices_2d.shape != (num_tokens, self._extra_topk):
                 raise ValueError(
                     f"extra_indices shape {tuple(extra_indices.shape)} != "
-                    f"({num_tokens}, {self._extra_topk})"
+                    f"({num_tokens}, {self._extra_topk}) (or 3-D equivalent)"
                 )
+        else:
+            extra_indices_2d = None
+
+        # Same flexibility for ``out``: caller may hand us 3-D or 4-D.
+        # Since the underlying ops write into the storage we forward
+        # ``out`` to, the dimensionality only matters for shape checks
+        # done by the op layer (which expects 3-D), so squeeze a
+        # singleton s_q axis if present.
+        out_2dim = out
+        if out is not None and out.dim() == 4 and out.size(1) == 1:
+            out_2dim = out.squeeze(1)
 
         result = sparse_mla_fwd(
-            q=q,
+            q=q_2dim,
             kv_cache=kv_cache,
-            indices=sparse_indices,
+            indices=sparse_indices_2d,
             sm_scale=self._sm_scale,
             d_v=self._head_dim_v,
-            out=out,
+            out=out_2dim,
             extra_kv_cache=extra_kv_cache,
-            extra_indices=extra_indices,
+            extra_indices=extra_indices_2d,
             topk_length=sparse_topk_lens,
             extra_topk_length=extra_topk_lens,
             attn_sink=self._attn_sink,
