@@ -114,6 +114,22 @@ void get_decode_metadata(
     torch::Tensor sched_meta,
     torch::Tensor num_splits);
 
+// Forward declaration — SWA paged slot-ID + window-length compute
+// (replaces vLLM's Triton _compute_swa_indices_and_lens_kernel to eliminate
+// the inference-time JIT site).
+void compute_swa_indices_and_lens(
+    torch::Tensor swa_indices,
+    torch::Tensor swa_lens,
+    int window_size,
+    torch::Tensor query_start_loc,
+    torch::Tensor seq_lens,
+    torch::Tensor token_to_req_indices,
+    torch::Tensor is_valid_token,
+    torch::Tensor block_table,
+    int block_size,
+    int token_offset,
+    int num_tokens);
+
 // Forward declarations — prefill
 void sparse_mla_prefill_launch_v32(
     torch::Tensor Q, torch::Tensor KV_cache, torch::Tensor indices,
@@ -489,6 +505,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("topk_length") = py::none(),
           py::arg("extra_topk_length") = py::none(),
           py::arg("sched_meta"), py::arg("num_splits"));
+    m.def("compute_swa_indices_and_lens", &compute_swa_indices_and_lens,
+          "Compute SWA paged slot IDs + per-token window lengths "
+          "(CUDA port of vLLM's _compute_swa_indices_and_lens_kernel; "
+          "no Triton JIT at inference time)",
+          py::arg("swa_indices"), py::arg("swa_lens"),
+          py::arg("window_size"),
+          py::arg("query_start_loc"), py::arg("seq_lens"),
+          py::arg("token_to_req_indices"),
+          py::arg("is_valid_token"),
+          py::arg("block_table"),
+          py::arg("block_size"),
+          py::arg("token_offset"),
+          py::arg("num_tokens"));
     m.def("sparse_mla_prefill_fwd", &sparse_mla_prefill_fwd,
           "Sparse MLA prefill forward (SM120, V32+MODEL1) — supports dual-cache",
           py::arg("Q"),
